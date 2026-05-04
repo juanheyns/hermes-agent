@@ -74,6 +74,10 @@ _PROVIDER_ALIASES = {
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
     "claude-code": "anthropic",
+    # Embedded ``claude -p`` subprocess adapter. Opt-in only.
+    "claude_cli": "claude-cli",
+    "claudecli": "claude-cli",
+    "cc-cli": "claude-cli",
 }
 
 
@@ -692,6 +696,55 @@ class AsyncAnthropicAuxiliaryClient:
         self.base_url = sync_wrapper.base_url
 
 
+# ── claude_cli (embedded `claude -p` subprocess) auxiliary client ───────────
+#
+# Wraps agent.claude_cli.ClaudeCliClient so aux callers can treat it exactly
+# like any other OpenAI-shape client. Reuses _AnthropicCompletionsAdapter
+# because ClaudeCliClient already mimics the Anthropic SDK's messages.create
+# surface — no separate adapter logic is needed.
+#
+# Opt-in only: the "claude-cli" provider is never selected by the auto chain.
+# See resolve_provider_client for the dispatch.
+
+
+class ClaudeCliAuxiliaryClient:
+    """OpenAI-client-compatible wrapper over an embedded ``claude -p`` subprocess.
+
+    One persistent :class:`agent.claude_cli.ClaudeCliClient` is shared across
+    aux calls. Conversation history between aux calls is unrelated, so the
+    session manager automatically rotates CC sessions on each call (digest
+    prefix differs). The per-call rotation overhead (~1 s cold start of a new
+    session) matches the cost of spawning a fresh subprocess each time — but
+    this way the subprocess owner stays stable for the life of the aux client.
+    """
+
+    def __init__(self, real_client: Any, model: str):
+        self._real_client = real_client
+        # is_oauth=False because CC owns its own auth; we must not inject
+        # Claude-Code identity headers into requests that never reach
+        # api.anthropic.com directly.
+        adapter = _AnthropicCompletionsAdapter(real_client, model, is_oauth=False)
+        self.chat = _AnthropicChatShim(adapter)
+        self.api_key = "claude-cli"
+        # Synthetic base_url so _to_async_client's other branches don't match
+        # (we intercept this class explicitly).
+        self.base_url = "claude-cli://local"
+
+    def close(self):
+        close_fn = getattr(self._real_client, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+
+class AsyncClaudeCliAuxiliaryClient:
+    def __init__(self, sync_wrapper: "ClaudeCliAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        async_adapter = _AsyncAnthropicCompletionsAdapter(sync_adapter)
+        self.chat = _AsyncAnthropicChatShim(async_adapter)
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+
+
 def _read_nous_auth() -> Optional[dict]:
     """Read and validate ~/.hermes/auth.json for an active Nous provider.
 
@@ -1233,6 +1286,44 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
 
 
+# Default aux model for claude_cli. "sonnet" is the CC alias; users can
+# override via auxiliary.<task>.model in config.yaml.
+_CLAUDE_CLI_AUX_MODEL = "sonnet"
+
+
+def _try_claude_cli(model: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
+    """Build an auxiliary client backed by the embedded ``claude -p`` subprocess.
+
+    Returns (None, None) if the ``claude`` CLI is not installed. Does not
+    check auth — ``claude -p`` reports auth failure on first request, which
+    the adapter surfaces as an ``OAuthExpired`` error.
+
+    Explicit opt-in only: never selected by the auto chain.
+    """
+    try:
+        from agent.claude_cli import build_claude_cli_client
+        from agent.claude_cli.config import resolve_claude_bin
+        from agent.claude_cli.errors import SpawnFailed
+    except ImportError:
+        logger.debug("Auxiliary client: agent.claude_cli not importable")
+        return None, None
+
+    try:
+        claude_bin = resolve_claude_bin()
+    except SpawnFailed as e:
+        logger.warning("Auxiliary client: claude-cli requested but %s", e)
+        return None, None
+
+    resolved_model = model or _CLAUDE_CLI_AUX_MODEL
+    logger.debug("Auxiliary client: claude-cli (%s)", resolved_model)
+    real_client = build_claude_cli_client(
+        model_default=resolved_model,
+        claude_bin=claude_bin,
+        cwd=os.getcwd(),
+    )
+    return ClaudeCliAuxiliaryClient(real_client, resolved_model), resolved_model
+
+
 _AUTO_PROVIDER_LABELS = {
     "_try_openrouter": "openrouter",
     "_try_nous": "nous",
@@ -1484,6 +1575,8 @@ def _to_async_client(sync_client, model: str):
 
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, ClaudeCliAuxiliaryClient):
+        return AsyncClaudeCliAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
     try:
@@ -1631,6 +1724,19 @@ def resolve_provider_client(
                            "but OPENROUTER_API_KEY not set")
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
+        return (_to_async_client(client, final_model) if async_mode
+                else (client, final_model))
+
+    # ── claude-cli (embedded `claude -p` subprocess) ─────────────────
+    # Explicit opt-in only. Never selected by the auto chain.
+    if provider == "claude-cli":
+        client, default = _try_claude_cli(model)
+        if client is None:
+            logger.warning("resolve_provider_client: claude-cli requested "
+                           "but the 'claude' CLI is not installed — "
+                           "run: npm install -g @anthropic-ai/claude-code")
+            return None, None
+        final_model = model or default
         return (_to_async_client(client, final_model) if async_mode
                 else (client, final_model))
 

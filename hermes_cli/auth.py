@@ -324,6 +324,19 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=(),
         base_url_env_var="BEDROCK_BASE_URL",
     ),
+    "claude-cli": ProviderConfig(
+        id="claude-cli",
+        name="Claude Code (embedded subprocess)",
+        # Auth is handled entirely by the local `claude` CLI binary —
+        # Hermes never touches credentials for this provider. The new
+        # auth_type intentionally doesn't match any of the existing
+        # credential-resolution branches (``api_key``, ``oauth_*``,
+        # ``external_process``, ``aws_sdk``) so those skip cleanly.
+        auth_type="embedded_subprocess",
+        # No real base_url — the binary owns all networking.
+        inference_base_url="",
+        api_key_env_vars=(),
+    ),
 }
 
 
@@ -1018,6 +1031,8 @@ def resolve_provider(
         "aws": "bedrock", "aws-bedrock": "bedrock", "amazon-bedrock": "bedrock", "amazon": "bedrock",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
         "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
+        # Embedded `claude -p` subprocess provider aliases
+        "claude_cli": "claude-cli", "claudecli": "claude-cli", "cc-cli": "claude-cli",
         # Local server aliases — route through the generic custom provider
         "lmstudio": "custom", "lm-studio": "custom", "lm_studio": "custom",
         "ollama": "custom", "ollama_cloud": "ollama-cloud",

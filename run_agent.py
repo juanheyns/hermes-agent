@@ -856,6 +856,15 @@ class AIAgent:
         elif self.provider == "anthropic" or (provider_name is None and self._base_url_hostname == "api.anthropic.com"):
             self.api_mode = "anthropic_messages"
             self.provider = "anthropic"
+        elif self.provider == "claude-cli":
+            # Embedded `claude -p` subprocess adapter. Wire format matches
+            # anthropic_messages (same Message shape, same SDK-compatible
+            # client surface), so all downstream dispatch works unchanged.
+            # The init block below detects provider == "claude-cli" and
+            # picks agent.claude_cli.ClaudeCliClient instead of the real
+            # Anthropic SDK client. OAuth refresh is bypassed for this
+            # provider (CC owns its own auth).
+            self.api_mode = "anthropic_messages"
         elif self._base_url_lower.rstrip("/").endswith("/anthropic"):
             # Third-party Anthropic-compatible endpoints (e.g. MiniMax, DashScope)
             # use a URL convention ending in /anthropic. Auto-detect these so the
@@ -1093,10 +1102,33 @@ class AIAgent:
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+            # Embedded `claude -p` subprocess adapter. Entirely self-contained:
+            # no Anthropic SDK client, no OAuth token handling, no base_url.
+            # ClaudeCliClient implements the messages.create/stream surface so
+            # the rest of the anthropic_messages dispatch works unchanged.
+            _is_claude_cli = self.provider == "claude-cli"
             # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
             # (prompt caching, thinking budgets, adaptive thinking).
             _is_bedrock_anthropic = self.provider == "bedrock"
-            if _is_bedrock_anthropic:
+            if _is_claude_cli:
+                from agent.claude_cli import build_claude_cli_client
+                self._anthropic_client = build_claude_cli_client(
+                    model_default=self.model,
+                    cwd=os.getcwd(),
+                    request_timeout_s=_provider_timeout,
+                )
+                self._anthropic_api_key = "claude-cli"
+                self._anthropic_base_url = None
+                # CC handles its own auth. Never mark this session as
+                # OAuth-authenticated — that would inject Claude-Code identity
+                # headers into requests the adapter doesn't issue anyway.
+                self._is_anthropic_oauth = False
+                self.api_key = "claude-cli"
+                self.client = None
+                self._client_kwargs = {}
+                if not self.quiet_mode:
+                    print(f"🤖 AI Agent initialized with model: {self.model} (claude -p subprocess)")
+            elif _is_bedrock_anthropic:
                 from agent.anthropic_adapter import build_anthropic_bedrock_client
                 _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
                 _br_region = _region_match.group(1) if _region_match else "us-east-1"

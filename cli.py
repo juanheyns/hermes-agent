@@ -3102,28 +3102,33 @@ class HermesCLI:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
-        if not isinstance(api_key, str) or not api_key:
-            # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
-            # don't require authentication.  When a base_url IS configured but
-            # no API key was found, use a placeholder so the OpenAI SDK
-            # doesn't reject the request and local servers just ignore it.
-            _source = runtime.get("source", "")
-            _has_custom_base = isinstance(base_url, str) and base_url and "openrouter.ai" not in base_url
-            if _has_custom_base:
-                api_key = "no-key-required"
-                logger.debug(
-                    "No API key for custom endpoint %s (source=%s), "
-                    "using placeholder — local servers typically ignore auth",
-                    base_url, _source,
-                )
-            else:
-                print("\n⚠️  Provider resolver returned an empty API key. "
-                      "Set OPENROUTER_API_KEY or run: hermes setup")
+        # The embedded `claude -p` subprocess provider has no api_key and no
+        # base_url — the local CLI binary handles all auth and networking.
+        # Skip the credential / endpoint guards for this path.
+        _is_claude_cli = resolved_provider == "claude-cli"
+        if not _is_claude_cli:
+            if not isinstance(api_key, str) or not api_key:
+                # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
+                # don't require authentication.  When a base_url IS configured but
+                # no API key was found, use a placeholder so the OpenAI SDK
+                # doesn't reject the request and local servers just ignore it.
+                _source = runtime.get("source", "")
+                _has_custom_base = isinstance(base_url, str) and base_url and "openrouter.ai" not in base_url
+                if _has_custom_base:
+                    api_key = "no-key-required"
+                    logger.debug(
+                        "No API key for custom endpoint %s (source=%s), "
+                        "using placeholder — local servers typically ignore auth",
+                        base_url, _source,
+                    )
+                else:
+                    print("\n⚠️  Provider resolver returned an empty API key. "
+                          "Set OPENROUTER_API_KEY or run: hermes setup")
+                    return False
+            if not isinstance(base_url, str) or not base_url:
+                print("\n⚠️  Provider resolver returned an empty base URL. "
+                      "Check your provider config or run: hermes setup")
                 return False
-        if not isinstance(base_url, str) or not base_url:
-            print("\n⚠️  Provider resolver returned an empty base URL. "
-                  "Check your provider config or run: hermes setup")
-            return False
 
         credentials_changed = api_key != self.api_key or base_url != self.base_url
         routing_changed = (

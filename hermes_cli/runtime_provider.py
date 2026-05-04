@@ -718,6 +718,19 @@ def resolve_runtime_provider(
     if explicit_runtime:
         return explicit_runtime
 
+    # Embedded `claude -p` subprocess provider — Hermes never touches
+    # credentials for this path; the local `claude` binary handles auth.
+    # Short-circuit before pool / OAuth resolution (none of which apply).
+    if provider == "claude-cli":
+        return {
+            "provider": "claude-cli",
+            "api_mode": "anthropic_messages",
+            "base_url": "",
+            "api_key": "claude-cli",  # sentinel; AIAgent ignores it
+            "source": "embedded",
+            "requested_provider": requested_provider,
+        }
+
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()

@@ -19,6 +19,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **GitHub Copilot** | `hermes model` (OAuth device code flow, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`) |
 | **GitHub Copilot ACP** | `hermes model` (spawns local `copilot --acp --stdio`) |
 | **Anthropic** | `hermes model` (Claude Pro/Max via Claude Code auth, Anthropic API key, or manual setup-token) |
+| **Claude Code (embedded)** | Install `claude` CLI, run `claude auth`, set `provider: claude-cli` in `config.yaml` |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **AI Gateway** | `AI_GATEWAY_API_KEY` in `~/.hermes/.env` (provider: `ai-gateway`) |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
@@ -184,6 +185,105 @@ model:
 :::tip Aliases
 `--provider claude` and `--provider claude-code` also work as shorthand for `--provider anthropic`.
 :::
+
+### Claude Code (embedded subprocess) — `claude-cli`
+
+Routes model calls through a local `claude -p` subprocess instead of hitting `api.anthropic.com` directly. Use this when Anthropic no longer accepts your Claude Code OAuth/setup token against the public API — Hermes shells out to the installed `claude` CLI, which handles auth, caching, and routing internally.
+
+**When to pick this over `anthropic`:**
+
+- Your Claude Code setup-token used to work with `provider: anthropic` but stopped (401/403 against `api.anthropic.com`).
+- You want model calls billed through your Claude Pro/Max subscription via Claude Code rather than a separate API key.
+- You don't need explicit prompt-cache control, vision inputs, or token-usage counters (see limitations below).
+
+**Setup:**
+
+1. Install Claude Code:
+   ```bash
+   npm install -g @anthropic-ai/claude-code
+   ```
+2. Authenticate once:
+   ```bash
+   claude auth
+   ```
+3. Point Hermes at it:
+   ```yaml
+   model:
+     provider: "claude-cli"
+     default: "sonnet"   # or "opus", "haiku", or a full model id
+   ```
+   Or one-shot: `hermes chat --provider claude-cli --model sonnet`.
+
+Under the hood Hermes spawns one `claude -p --input-format stream-json --output-format stream-json --tools "" --strict-mcp-config` subprocess per agent instance and reuses it across turns via `--resume`. Tool calls from Hermes's own tool loop are round-tripped to the model using a custom `<hermes:tool>` text-envelope protocol since Claude Code's built-in tools are disabled on this path.
+
+**Supported features:**
+
+- **Vision / image content blocks** — pass Anthropic-native `image` (and `document`) content blocks in `messages[].content`; they flow through to CC's stream-json stdin verbatim. Mixed text+image+tool_result payloads are handled too.
+- **Structured JSON output** — pass either `json_schema={...}` or the OpenAI-shim `response_format={"type":"json_schema","json_schema":{"schema":{...}}}` to `messages.create`. The validated object lands on `response.ccli_structured_output`. Note the trade-off: CC enforces structured output by injecting a synthetic tool, which adds one extra internal turn (`num_turns=2`) and roughly doubles per-call cost.
+- **Token / cost / duration metrics** — see the table below; flows into Hermes's existing `normalize_usage` cost tracking unchanged.
+- **Adaptive thinking** — `effort` levels in Hermes's reasoning config map to `--effort low|medium|high|xhigh|max`. `thinking_delta` events stream as Anthropic-shape thinking blocks.
+
+**Known limitations:**
+
+- **Explicit `cache_control` block hints** are dropped — Hermes can't pin specific cache breakpoints from this path. However, CC caches internally and reports read/write counts on every turn, so observability is preserved. In practice the system prompt (which is the largest stable prefix) is cached automatically by CC.
+- **OAuth refresh** is handled by Claude Code, not Hermes. If your CC session expires, Hermes surfaces an `OAuthExpired` error — re-authenticate with `claude auth`.
+- **Auxiliary tasks** (context compression, vision analysis, web extraction) are opt-in separately. To use `claude-cli` for these too, set `auxiliary.<task>.provider: claude-cli` in `config.yaml`. It is never selected automatically.
+- **Cold start** is ~1 s per agent init and ~0.8 s on session respawn after a tool call. Warm per-turn latency is sub-second.
+- **Concurrent turns** on a single agent's client are rejected with `ClientBusy` — the subprocess is single-writer. Auxiliary calls run on a separate client and don't conflict with the main loop.
+
+**What you get back on every turn:**
+
+Responses carry the standard Anthropic `usage` fields — `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` — so Hermes's cost tracking via `normalize_usage` works unchanged. Claude Code also reports a handful of extras under `ccli_*` attributes on each response:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `ccli_cost_usd` | Actual USD cost of the turn, as reported by Claude Code (includes any internal side-model spend like context summarization). |
+| `ccli_duration_ms` | Wall-clock duration of the turn in milliseconds. |
+| `ccli_duration_api_ms` | API-only duration (network + model latency). |
+| `ccli_ttft_ms` | Time to first token in milliseconds. |
+| `ccli_num_turns` | Number of API iterations CC ran internally for this turn. |
+| `ccli_service_tier` | `"standard"` or `"priority"` based on your CC account. |
+| `ccli_model_usage` | Per-model rollup — useful when CC uses a side model (e.g. Haiku) for internal summarization alongside your main model. |
+| `ccli_structured_output` | Validated JSON object when you passed `json_schema` / `response_format` — `None` otherwise. |
+
+The adapter also replaces its synthetic `msg_<uuid>` / alias model with the canonical Anthropic `msg_01…` id and concrete model slug (`claude-sonnet-4-6` instead of the `sonnet` alias) on each response.
+
+**Troubleshooting:**
+
+- `SpawnFailed: The 'claude' CLI is not installed…` — run the npm install above.
+- `OAuthExpired: Please run claude auth.` — run `claude auth` and retry.
+- Model hallucinates having MCP tools (Slack, Linear, etc.) despite `--tools ""` — this can happen if you run an older `claude` that predates `--strict-mcp-config` support. Update with `claude install latest`.
+- `QuotaExceeded: Third-party apps now draw from extra usage…` even though you have a Claude plan: Anthropic's billing classifier flags requests with large, schema-heavy system prompts as "third-party app" usage and charges them against the Extra Usage pool (which is typically zero). The adapter caps the rendered tool catalog at 18 KB by default (well under the empirical ~21 KB threshold). If you still see this:
+  1. Lower the cap further: `HERMES_CLAUDE_CLI_PROMPT_HARD=12000`.
+  2. Tighten descriptions: `HERMES_CLAUDE_CLI_MAX_DESC_CHARS=60`.
+  3. Reduce the tool count (disable toolsets you don't use).
+  4. Top up Extra Usage in your Anthropic workspace billing.
+  5. Switch to `provider: anthropic` with an `ANTHROPIC_API_KEY=sk-ant-…` (separate billing).
+
+**Tuning env vars:**
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `HERMES_CLAUDE_CLI_PROMPT_SOFT` | `15000` | INFO-log when composed system prompt exceeds this. |
+| `HERMES_CLAUDE_CLI_PROMPT_HARD` | `18000` | Hard cap; auto-truncate tool catalog above this size. |
+| `HERMES_CLAUDE_CLI_CATALOG_COMPACT` | `1` | `0` restores verbose JSON-schema dumps (debugging). |
+| `HERMES_CLAUDE_CLI_MAX_DESC_CHARS` | `120` | Per-tool description truncation. |
+| `HERMES_CLAUDE_CLI_SYSTEM_PROMPT_POLICY` | `replace` | `append` to keep CC's default identity prompt (~5× cost but may dodge classifier). |
+| `HERMES_CLAUDE_CLI_LOG` | `1` | Per-spawn shell-pasteable reproducer at `~/.hermes/logs/claude_cli/`. Set `0` to disable. |
+| `CCCLI_CLAUDE_BIN` | autodetected | Override `claude` binary path. |
+
+**Debugging a failing session:**
+
+Each spawned `claude -p` run drops a self-contained reproducer at `~/.hermes/logs/claude_cli/<ts>_<short-id>.repro.sh`. To replay outside Hermes:
+
+```bash
+# Replace --session-id with a fresh uuid (CC won't reuse a session id),
+# then run:
+LATEST=$(ls -1t ~/.hermes/logs/claude_cli/*.repro.sh | head -1)
+sed "s/--session-id [a-z0-9-]*/--session-id $(uuidgen)/" "$LATEST" | bash
+```
+
+This isolates "did the request fail in `claude -p` itself?" from "did the adapter mis-handle a successful response?" — important when triage points to one or the other. The script's heredoc contains the exact stdin lines that were sent during the session.
 
 ### GitHub Copilot
 
