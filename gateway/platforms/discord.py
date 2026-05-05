@@ -696,7 +696,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Non-bot: enforce the configured user/role allowlists.
                     if not self._is_allowed_user(str(message.author.id), message.author):
                         return
-                
+
+                # Drop emote-only messages from bots so end-of-conversation
+                # acks (🫡, 👀, :saluting_face:, custom server emojis, etc.)
+                # don't ping-pong between agents sharing a channel.
+                if getattr(message.author, "bot", False) and adapter_self._is_bot_emote_only_message(message):
+                    return
+
                 # Multi-agent filtering: if the message mentions specific bots
                 # but NOT this bot, the sender is talking to another agent —
                 # stay silent.  Messages with no bot mentions (general chat)
@@ -1940,6 +1946,33 @@ class DiscordAdapter(BasePlatformAdapter):
                         if any(getattr(r, "id", None) in allowed_roles for r in m_roles):
                             return True
         return False
+
+    def _is_bot_emote_only_message(self, message: DiscordMessage) -> bool:
+        """Detect bot messages whose only payload is emoji/reaction noise.
+
+        Strips Discord-only tokens (mentions, channel refs, custom emojis,
+        :shortcode: names) and whitespace; if no alphanumeric content remains,
+        the message is treated as a pure signal (emoji ack, salute, etc.) and
+        should not be delivered to the agent — otherwise two bots in the same
+        channel can ping-pong forever on closing emojis.
+        """
+        content = (message.content or "").strip()
+        if not content:
+            # Empty content with attachments/embeds is a real message,
+            # so leave that to other handlers.
+            return False
+
+        cleaned = re.sub(r"<@[!&]?\d+>", "", content)        # user/role mentions
+        cleaned = re.sub(r"<#\d+>", "", cleaned)              # channel mentions
+        cleaned = re.sub(r"<a?:[^:]+:\d+>", "", cleaned)      # custom emoji (incl. animated)
+        cleaned = re.sub(r":[a-zA-Z0-9_+-]+:", "", cleaned)   # :shortcode: names
+        cleaned = cleaned.strip()
+
+        if not cleaned:
+            return True
+        # Any word character (letters/digits in any script) means it's a
+        # real message — fall through to normal processing.
+        return not re.search(r"\w", cleaned, re.UNICODE)
 
     # ── Slash command authorization ─────────────────────────────────────
     # Slash commands (``_run_simple_slash`` and ``_handle_thread_create_slash``)
